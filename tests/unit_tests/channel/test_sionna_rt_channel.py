@@ -172,3 +172,14 @@ class TestSionnaRTChannel(unittest.TestCase):
         """Test Sionna RT channel realization serialization"""
         
         test_roundtrip_serialization(self, self.realization)
+
+    def test_getstate(self)-> None:
+        """Test the overrided method __getstate__()"""
+        state = self.channel.__getstate__()
+        self.assertNotIn("_SionnaRTChannel__scene",state)
+
+    def test_setstate(self)-> None:
+        """Test the overrided method __setstate__()"""
+        state = self.channel.__getstate__()
+        self.channel.__setstate__(state=state)
+        self.assertIn("_SionnaRTChannel__scene",state)
