@@ -8,7 +8,6 @@ from math import ceil
 import numpy as np
 
 import sionna.rt as rt  # type: ignore
-# import tensorflow as tf  # type: ignore
 
 from hermespy.channel.channel import ChannelSampleHook, InterpolationMode, LinkState
 from hermespy.core import (
@@ -42,7 +41,7 @@ class SionnaRTChannelSample(ChannelSample):
     # These members are Tensorflow tensors and SHOULD NOT be used directly.
     # It is a backup of sionna-rt.Paths properties used to reverse Doppler effect.
     __a: Any
-    __tau: Any
+    _tau: Any
 
     __gain: float
 
@@ -66,9 +65,7 @@ class SionnaRTChannelSample(ChannelSample):
         # Initialize class attributes
         self.paths = paths
         self.__a = paths.a
-        self.__tau = paths._tau
-        # self.__a = rt.tf.identity(paths._a)
-        # self.__tau = rt.tf.identity(paths._tau)
+        self._tau = paths._tau
         self.__gain = gain
 
     @property
@@ -83,50 +80,6 @@ class SionnaRTChannelSample(ChannelSample):
 
         return np.abs(np.sum(self.__a))
 
-    def __apply_doppler(self, num_samples: int) -> tuple:
-        """Apply Doppler effect using Sionna RT v1.0.2 via cir().
-           Doppler is now internally applied during CIR computation based on set velocities.
-           cir() doesnt modify the paths object unlike the apply_doppler() method from v0.19.0
-
-        Returns:
-           a: gains. Shape (num_rx_ants, num_tx_ants, num_paths, num_samples)
-           tau: delays. Shape (num_rx_ants, num_tx_ants, num_paths)
-        """
-        # # Apply doppler
-        # self.paths.apply_doppler(
-        #     sampling_frequency=self.bandwidth,
-        #     num_time_steps=num_samples,
-        #     tx_velocities=self.transmitter_velocity,
-        #     rx_velocities=self.receiver_velocity,
-        # )
-
-        # # Get and cast CIR
-        # a, tau = self.paths.cir()
-        # a = a.numpy()[0, 0, :, 0, :, :, :]
-        # tau = tau.numpy()[0, 0, 0, :]
-
-        # # Restore paths to the original state
-        # self.paths._a = rt.tf.identity(self.__a)
-        # self.paths._tau = rt.tf.identity(self.__tau)
-
-        # Set the Transmitter and Receiever velocity
-        self.paths._tx_velocities = self.transmitter_velocity  # in m/s
-        self.paths._rx_velocities = self.receiver_velocity
-
-        # Get and cast CIR with Doppler automatically applied
-        a, tau = self.paths.cir(
-            sampling_frequency=self.bandwidth,
-            num_time_steps=num_samples,
-            normalize_delays=False,
-            out_type="numpy",
-        )
-
-        # Extract and reshape as needed
-        a = a[0, :, 0, :, :, :]
-        tau = tau[0, 0, :]
-
-        return a, tau
-
     @override
     def state(
         self,
@@ -134,13 +87,22 @@ class SionnaRTChannelSample(ChannelSample):
         max_num_taps: int,
         interpolation_mode: InterpolationMode = InterpolationMode.NEAREST,
     ) -> ChannelStateInformation:
+
         # Apply Doppler effect and get the channel impulse response
-        a, tau = self.__apply_doppler(num_samples)
+        # the cir() method applied doppler internally
+        a, tau = self.paths.cir(
+            sampling_frequency=self.bandwidth,
+            num_time_steps=num_samples,
+            normalize_delays=False,
+            out_type="numpy",
+        )
+        # Extract and reshape the path properties as needed
+        a = a[0, :, 0, :, :, :]
+        tau = tau[0, 0, :]
 
         # Init result
-        # tau.size changed to np.prod(tau.shape) for the sionna-rt v1.0.2 compatibility and the same for a
 
-        max_delay = np.max(tau) if np.prod(tau.shape) != 0 else 0
+        max_delay = np.max(tau) if np.size(tau) != 0 else 0
         max_delay_in_samples = min(max_num_taps, ceil(max_delay * self.bandwidth))
         raw_state = np.zeros(
             (
@@ -152,7 +114,7 @@ class SionnaRTChannelSample(ChannelSample):
             dtype=np.complex128,
         )
         # If no paths hit the target, then return an empty state
-        if np.prod(a.shape) == 0 or np.prod(tau.shape) == 0:
+        if np.size(a) == 0 or np.size(tau) == 0:
             return ChannelStateInformation(ChannelStateFormat.IMPULSE_RESPONSE, raw_state)
 
         for a_p, tau_p in zip(np.moveaxis(a, -2, 0), np.moveaxis(tau, -1, 0)):
@@ -178,9 +140,18 @@ class SionnaRTChannelSample(ChannelSample):
         num_samples_new = int(signal_block.num_samples * sr_ratio)
 
         # Apply Doppler effect and get the channel impulse response
-        a, tau = self.__apply_doppler(signal_block.num_samples)
+        # the cir() method applied doppler internally
+        a, tau = self.paths.cir(
+            sampling_frequency=self.bandwidth,
+            num_time_steps=signal_block.num_samples,
+            normalize_delays=False,
+            out_type="numpy",
+        )
+        # Extract and reshape as needed
+        a = a[0, :, 0, :, :, :]
+        tau = tau[0, 0, :]
         # If no paths hit the target, then return a zeroed signal
-        if a.size == 0 or tau.size == 0:
+        if np.size(a) == 0 or np.size(tau) == 0:
             return SignalBlock(
                 np.zeros((num_streams_new, num_samples_new), signal_block.dtype), offset_new
             )
@@ -262,17 +233,11 @@ class SionnaRTChannelRealization(ChannelRealization[SionnaRTChannelSample]):
         self.__scene.tx_array = rt.PlanarArray(
             num_rows=1, num_cols=1, horizontal_spacing=0.5, pattern="iso", polarization="V"
         )
-        # tx_antenna = rt.Antenna("iso", "V")
-        # tx_positions = [a.position for a in state.transmitter.antennas.transmit_antennas]
-        # self.__scene.tx_array = rt.AntennaArray(tx_antenna, tx_positions)
 
         # init self.scene.rx_array
         self.__scene.rx_array = rt.PlanarArray(
             num_rows=1, num_cols=1, horizontal_spacing=0.5, pattern="iso", polarization="V"
         )
-        # rx_antenna = rt.Antenna("iso", "V")
-        # rx_positions = [a.position for a in state.receiver.antennas.receive_antennas]
-        # self.__scene.rx_array = rt.AntennaArray(rx_antenna, rx_positions)
 
         # init tx and rx
         self.__scene.add(rt.Transmitter("Alpha device", state.transmitter.position))
@@ -280,7 +245,6 @@ class SionnaRTChannelRealization(ChannelRealization[SionnaRTChannelSample]):
 
         # set other self.scene params
         self.__scene.frequency = state.transmitter.carrier_frequency
-        # self.__scene.synthetic_array = True
 
         # calculate paths
         p_solver = rt.PathSolver()
@@ -294,8 +258,6 @@ class SionnaRTChannelRealization(ChannelRealization[SionnaRTChannelSample]):
             synthetic_array=True,
             seed=41,
         )
-        # paths = self.__scene.compute_paths()
-        # paths.normalize_delays = False
 
         # construct the sample
         return SionnaRTChannelSample(paths, self.gain, state)
@@ -379,8 +341,7 @@ class SionnaRTChannel(Channel[SionnaRTChannelRealization, SionnaRTChannelSample]
         base_state = Channel.__getstate__(self)
         base_state.pop("_SionnaRTChannel__scene", None)
         return base_state
-    
-    @override
+
     def __setstate__(self, state: dict) -> None:
         self.__scene = rt.load_scene(state["_SionnaRTChannel__scene_file"])
         for key, value in state.items():
